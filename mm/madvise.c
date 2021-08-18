@@ -16,6 +16,7 @@
 #include <linux/falloc.h>
 #include <linux/sched.h>
 #include <linux/ksm.h>
+#include <linux/usm.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/blkdev.h>
@@ -111,6 +112,14 @@ static long madvise_behavior(struct vm_area_struct *vma,
 			 * madvise() returns EAGAIN if kernel resources, such as
 			 * slab, are temporarily unavailable.
 			 */
+			if (error == -ENOMEM)
+				error = -EAGAIN;
+			goto out;
+		}
+		break;
+	case MADV_SHAREABLE:
+		error = usm_madvise(vma, start, end, behavior, &new_flags);
+		if (error) {
 			if (error == -ENOMEM)
 				error = -EAGAIN;
 			goto out;
@@ -705,6 +714,7 @@ madvise_behavior_valid(int behavior)
 	case MADV_WILLNEED:
 	case MADV_DONTNEED:
 	case MADV_FREE:
+	case MADV_SHAREABLE:
 #ifdef CONFIG_KSM
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
@@ -766,6 +776,9 @@ madvise_behavior_valid(int behavior)
  *  MADV_MERGEABLE - the application recommends that KSM try to merge pages in
  *		this area with pages of identical content from other such areas.
  *  MADV_UNMERGEABLE- cancel MADV_MERGEABLE: no longer merge pages with others.
+ *  MADV_SHAREABLE - the serverless user recommands a memory area, the pages
+ * 		in that region can be merged with pages of identical content from other
+ *		such areas.
  *  MADV_HUGEPAGE - the application wants to back the given range by transparent
  *		huge pages in the future. Existing pages might be coalesced and
  *		new pages might be allocated as THP.
