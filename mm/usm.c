@@ -205,21 +205,21 @@ static inline int add_page_to_hash_table(u64 hash_value, int hash_index, struct 
     if (!new_page_node || !new_rmap_node) {
         return -ENOMEM;
     }
-    printk("Adding page to the page table...\n");
-    /* acquire the hash lock */
+    printk("Adding page to the page tables...\n");
+    spin_lock(&page_hash_lock);
     new_page_node->hash_value = hash_value;
     new_page_node->page = page;
     new_page_node->mm = mm;
     new_page_node->addr = addr;
     hlist_add_head(&new_page_node->hlist_link, &page_hash_table[hash_index]);
-    /* release the hash lock */
+    spin_unlock(&page_hash_lock);
 
-    /* acquire the rmap table lock */
+    spin_lock(&rmap_hash_lock);
     new_rmap_node->old_hash_value = hash_value;
     new_rmap_node->addr = addr;
     new_rmap_node->mm = mm;
     hlist_add_head(&new_rmap_node->hlist_link, &rmap_hash_table[addr % nrmap_hash]);
-    /* release the rmap table lock */
+    spin_unlock(&rmap_hash_lock);
 
     return 0;
 }
@@ -387,14 +387,15 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
     pte_t *ptep;
     struct hlist_head *bucket;
     struct hlist_node *n;
+    struct hlist_node *node;
     struct rmap_node *rmap_node;
     struct page *hash_page[1];
     struct vm_area_struct *cur_page_node_vma;
     struct mm_struct *cur_page_node_mm;
 
-    // get page hash table lock
     /* Iterate through each page in the hash table has the same hash_index */
-    hlist_for_each_entry(cur_page_node, &page_hash_table[hash_index], hlist_link){
+    spin_lock(&page_hash_lock);
+    hlist_for_each_entry_safe(cur_page_node, node, &page_hash_table[hash_index], hlist_link){
         if (cur_page_node->hash_value == hash_value){
             /* Check if cur_page_node is still present */
             ptep = get_locked_pte(cur_page_node->mm, cur_page_node->addr, &ptl);
@@ -461,7 +462,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
 
     delete_hash_table_node:
         hash_del(&cur_page_node->hlist_link);
-        // get the rmap hash table lock
+        spin_lock(&rmap_hash_lock);
         bucket = &rmap_hash_table[cur_page_node->addr % nrmap_hash];
         hlist_for_each_entry_safe(rmap_node, n, bucket, hlist_link) {
             if (rmap_node->addr == cur_page_node->addr) {
@@ -469,6 +470,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
                 break;
             }
         }
+        spin_unlock(&rmap_hash_lock);
         continue;
     unlock:
         munlock_vma_page(hash_page[0]);
@@ -484,6 +486,8 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
             return r;
         }
     }
+    spin_unlock(&page_hash_lock);
+
     /* if the function haven't returned yet, this means no matching page is found, add this page to the hash table */
     r = add_page_to_hash_table(hash_value, hash_index, page, addr, mm);
     return r;
@@ -541,12 +545,12 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
         hash_index = get_hash_index(hash_value);
 
         /* Check if the page is already stored by USM */
-        // get the lock of the rmap hash table
+        spin_lock(&rmap_hash_lock);
         rmap_bucket = &(rmap_hash_table[cur_addr % nrmap_hash]);
         hlist_for_each_entry_safe(old_rmap_node, n, rmap_bucket, hlist_link) {
             if (old_rmap_node->old_hash_value != hash_value || old_rmap_node->mm != mm) {
                 hash_del(&old_rmap_node->hlist_link);
-                // get the lock of page hash table
+                spin_lock(&page_hash_lock);
                 page_bucket = &(page_hash_table[old_rmap_node->old_hash_value % npage_hash]);
                 hlist_for_each_entry_safe(old_page_node, cur_node, page_bucket, hlist_link) {
                     if (old_page_node->hash_value == old_rmap_node->old_hash_value) {
@@ -554,10 +558,13 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
                         break;
                     }
                 }
+                spin_unlock(&page_hash_lock);
+                spin_unlock(&rmap_hash_lock);
                 goto search_hash_table;
             }
             else {
                 /* The page is already added to USM, no need to do anything */
+                spin_unlock(&rmap_hash_lock);
                 goto next;
             }
         }
