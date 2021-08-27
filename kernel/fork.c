@@ -65,6 +65,7 @@
 #include <linux/profile.h>
 #include <linux/rmap.h>
 #include <linux/ksm.h>
+#include <linux/usm.h>
 #include <linux/acct.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/tsacct_kern.h>
@@ -970,6 +971,7 @@ static inline void __mmput(struct mm_struct *mm)
 	uprobe_clear_state(mm);
 	exit_aio(mm);
 	ksm_exit(mm);
+	usm_exit(mm);
 	khugepaged_exit(mm); /* must run before exit_mmap */
 	exit_mmap(mm);
 	mm_put_huge_zero_page(mm);

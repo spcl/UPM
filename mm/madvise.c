@@ -116,8 +116,10 @@ static long madvise_behavior(struct vm_area_struct *vma,
 				error = -EAGAIN;
 			goto out;
 		}
+		new_flags |= VM_SHAREABLE;
 		break;
 	case MADV_SHAREABLE:
+		pr_info("enter madvise case MADV_SHAREABLE\n");
 		error = usm_madvise(vma, start, end, behavior, &new_flags);
 		if (error) {
 			if (error == -ENOMEM)

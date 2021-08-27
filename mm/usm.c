@@ -1,19 +1,3 @@
-/*
- * Memory merging support.
- *
- * This code enables dynamic sharing of identical pages found in different
- * memory areas, even if they are not shared by fork()
- *
- * Copyright (C) 2008-2009 Red Hat, Inc.
- * Authors:
- *	Izik Eidus
- *	Andrea Arcangeli
- *	Chris Wright
- *	Hugh Dickins
- *
- * This work is licensed under the terms of the GNU GPL, version 2.
- */
-
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
@@ -25,24 +9,14 @@
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
 #include <linux/spinlock.h>
-#include <linux/jhash.h>
-#include <linux/delay.h>
-#include <linux/kthread.h>
-#include <linux/wait.h>
 #include <linux/slab.h>
-#include <linux/rbtree.h>
 #include <linux/memory.h>
-#include <linux/mmu_notifier.h>
-#include <linux/swap.h>
 #include <linux/hashtable.h>
-#include <linux/freezer.h>
 #include <linux/oom.h>
-#include <linux/numa.h>
 #include <linux/xxhash.h>
 #include <linux/compiler.h>
 
 #include <asm/tlbflush.h>
-#include <asm/current.h>
 #include <asm/pgtable.h>
 #include <asm/spinlock.h>
 
@@ -82,7 +56,7 @@ static inline int page_hash_table_init(void)
     npage_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE / PAGE_SIZE;
 	page_hash_table = kzalloc(npage_hash * sizeof(struct hlist_head), GFP_KERNEL);
 	if (!page_hash_table) {
-        printk("Error: cannot allocate space for page hash table, quiting\n");
+        pr_err("usm: cannot allocate space for page hash table, quiting\n");
         return -1;
     }
     return 0;
@@ -93,7 +67,7 @@ static inline int rmap_hash_table_init(void)
     nrmap_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE / PAGE_SIZE;
 	page_hash_table = kzalloc(nrmap_hash * sizeof(struct hlist_head), GFP_KERNEL);
 	if (!page_hash_table) {
-        printk("Error: cannot allocate space for rmap hash table, quiting\n");
+        pr_err("usm: cannot allocate space for rmap hash table, quiting\n");
         return -1;
     }
     return 0;
@@ -132,7 +106,7 @@ static inline int page_node_cache_init(void)
     page_node_cache = kmem_cache_create("page_node_cache", sizeof(struct page_node),
                                         sizeof(struct page_node), SLAB_HWCACHE_ALIGN, NULL);
     if (!page_node_cache) {
-        printk("Error: cannot allocate space for page node cache, quiting\n");
+        pr_err("usm: cannot allocate space for page node cache, quiting\n");
         return -1;
     }
     return 0;
@@ -143,7 +117,7 @@ static inline int rmap_node_cache_init(void)
     rmap_node_cache = kmem_cache_create("rmap_node_cache", sizeof(struct rmap_node),
                                         sizeof(struct rmap_node), SLAB_HWCACHE_ALIGN, NULL);
     if (!rmap_node_cache) {
-        printk("Error: cannot allocate space for rmap node cache, quiting\n");
+        pr_err("usm: cannot allocate space for rmap node cache, quiting\n");
         return -1;
     }
     return 0;
@@ -205,7 +179,7 @@ static inline int add_page_to_hash_table(u64 hash_value, int hash_index, struct 
     if (!new_page_node || !new_rmap_node) {
         return -ENOMEM;
     }
-    printk("Adding page to the page tables...\n");
+    pr_info("Adding page at addr %ld to the page tables...\n", addr);
     spin_lock(&page_hash_lock);
     new_page_node->hash_value = hash_value;
     new_page_node->page = page;
@@ -225,9 +199,9 @@ static inline int add_page_to_hash_table(u64 hash_value, int hash_index, struct 
 }
 
 /* 
- * return -1: write_protect_page fails, go to next madivsed page.
- * return -2: write_protect_page fails, go to next page in the hash table.
- * return 0: write_protect_page succeeds.
+ * Return -1: write_protect_page fails, go to next madivsed page.
+ * Return -2: write_protect_page fails, go to next page in the hash table.
+ * Return 0: write_protect_page succeeds.
  */
 static int write_protect_page(struct page *page1, struct page *page2, 
                     struct vm_area_struct *vma1, struct vm_area_struct *vma2)
@@ -304,9 +278,7 @@ static void revert_write_protect(struct page *page1, struct page *page2,
     pte_unmap_unlock(ptep2, ptl2);
 }
 
-/* 
- * Replace page1 pointed by addr1 with page2.
- */
+/* replace page1 pointed by addr1 with page2 */
 static inline int replace_page(struct page *page1, struct page *page2, 
                     struct vm_area_struct *vma1, struct vm_area_struct *vma2,
                     unsigned long addr1, unsigned long addr2)
@@ -317,7 +289,7 @@ static inline int replace_page(struct page *page1, struct page *page2,
     pte_t *ptep2;
     spinlock_t *ptl1;
     spinlock_t *ptl2;
-    pgprot_t pgprot;  //page protection bits of page1
+    pgprot_t pgprot;  // page protection bits of page1
     struct mm_struct *mm1 = vma1->vm_mm;
     struct mm_struct *mm2 = vma2->vm_mm;
     unsigned long address1;
@@ -371,6 +343,9 @@ static inline int replace_page(struct page *page1, struct page *page2,
 	pte_unmap_unlock(ptep2, ptl2);
 out:
     pte_unmap_unlock(ptep1, ptl1);
+    if (err == 0) {
+        pr_info("usm: replace page succeeds\n");
+    }
     return err;
 }
 
@@ -393,11 +368,11 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
     struct vm_area_struct *cur_page_node_vma;
     struct mm_struct *cur_page_node_mm;
 
-    /* Iterate through each page in the hash table has the same hash_index */
+    /* iterate through each page in the hash table has the same hash_index */
     spin_lock(&page_hash_lock);
     hlist_for_each_entry_safe(cur_page_node, node, &page_hash_table[hash_index], hlist_link){
         if (cur_page_node->hash_value == hash_value){
-            /* Check if cur_page_node is still present */
+            /* check if cur_page_node is still present */
             ptep = get_locked_pte(cur_page_node->mm, cur_page_node->addr, &ptl);
             if (!ptep || !pte_present(*ptep)) {
                 pte_unmap_unlock(ptep, ptl);
@@ -421,7 +396,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
             if (PageAnon(hash_page[0]) ^ PageAnon(page)) {
                 continue;
             }
-            /* Check if the two pages already share the same physical page */
+            /* check if the two pages already share the same physical page */
             if (unlikely(page_to_pfn(page) == page_to_pfn(hash_page[0]))) {
                 return 0;
             }
@@ -436,15 +411,15 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
             mlock_vma_page(page);
             mlock_vma_page(hash_page[0]);
 
-            /* Write-protect both pages */
+            /* write-protect both pages */
             r = write_protect_page(page, hash_page[0], vma, cur_page_node_vma);
             if (r) {
                 goto unlock;
             }
             if (do_byte_by_byte_cmp(page, cur_page_node->page) == 0) {
-                printk("found page %ld with the same content with page %ld\n", 
+                pr_info("found page %ld with the same content with page %ld\n", 
                         addr, cur_page_node->addr);
-                /* merge page */
+                /* merge the pages */
                 if (replace_page(page, cur_page_node->page, vma, 
                                 cur_page_node_vma, addr, cur_page_node->addr) < 0) {
                     revert_write_protect(page, cur_page_node->page, vma, cur_page_node_vma);
@@ -465,7 +440,8 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
         spin_lock(&rmap_hash_lock);
         bucket = &rmap_hash_table[cur_page_node->addr % nrmap_hash];
         hlist_for_each_entry_safe(rmap_node, n, bucket, hlist_link) {
-            if (rmap_node->addr == cur_page_node->addr) {
+            if (rmap_node->addr == cur_page_node->addr &&\
+                rmap_node->mm == cur_page_node->mm) {
                 hash_del(&rmap_node->hlist_link);
                 break;
             }
@@ -488,8 +464,15 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
     }
     spin_unlock(&page_hash_lock);
 
-    /* if the function haven't returned yet, this means no matching page is found, add this page to the hash table */
+    /*
+     * If the function haven't returned yet, this means no matching page is found,
+     * add this page to the hash table.
+     */
     r = add_page_to_hash_table(hash_value, hash_index, page, addr, mm);
+    if (r == 0) {
+        set_bit(MMF_VM_SHAREABLE, &mm->flags);
+        vma->vm_flags |= VM_SHAREABLE;
+    }
     return r;
 }
 
@@ -499,7 +482,6 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
 int usm_madvise(struct vm_area_struct *vma, unsigned long start,
 		unsigned long end, int advice, unsigned long *vm_flags)
 {
-    int error = 0;
 	unsigned long cur_addr;
     struct page *cur_page;
     struct mm_struct *mm;
@@ -511,27 +493,19 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
     u64 hash_value;
     int hash_index;
 
-    /* Initialize the data structures */
-    if (page_hash_table_init() < 0) {
-        return -ENOMEM;
+    pr_info("User madvise address %ld, size %ld\n", start, end - start);
+
+    if (*vm_flags & (VM_SHARED  | VM_MAYSHARE   |
+				 VM_PFNMAP    | VM_IO      | VM_DONTEXPAND |
+				 VM_HUGETLB | VM_MIXEDMAP))
+		return 0;
+
+    mm = vma->vm_mm;
+    if (mm) {
+        mmgrab(mm);
     }
-    if (page_node_cache_init() < 0) {
-        error = -ENOMEM;
-        goto quit_free1;
-    }
-    if (rmap_hash_table_init() < 0) {
-        error = -ENOMEM;
-        goto quit_free2;
-    }
-    if (rmap_node_cache_init() < 0) {
-        error = -ENOMEM;
-        goto quit_free3;
-    }
-    spin_lock_init(&page_hash_lock);
-    spin_lock_init(&rmap_hash_lock);
 
 	for (cur_addr = start; cur_addr < end; cur_addr += PAGE_SIZE) {
-        mm = current->mm;
         up_read(&mm->mmap_sem);
 
         /* get the struct page at address cur_addr */
@@ -544,7 +518,7 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
         hash_value = get_hash_value(cur_page);
         hash_index = get_hash_index(hash_value);
 
-        /* Check if the page is already stored by USM */
+        /* check if the page is already stored by USM */
         spin_lock(&rmap_hash_lock);
         rmap_bucket = &(rmap_hash_table[cur_addr % nrmap_hash]);
         hlist_for_each_entry_safe(old_rmap_node, n, rmap_bucket, hlist_link) {
@@ -563,23 +537,100 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
                 goto search_hash_table;
             }
             else {
-                /* The page is already added to USM, no need to do anything */
+                /* the page is already added to USM, no need to do anything */
                 spin_unlock(&rmap_hash_lock);
                 goto next;
             }
         }
         search_hash_table:
             search_hash_table(hash_value, hash_index, cur_page, cur_addr, mm, vma);
+            return 0;
         next:
             continue;
     }
 
-    quit_free3:
+    mmdrop(mm);
+    return 0;
+}
+
+/* search in the mm the pages stored in the hash tables, and delete then */
+void usm_exit(struct mm_struct *mm)
+{
+    struct vm_area_struct *vma = mm->mmap;
+    unsigned long addr;
+    struct page_node *cur_page_node;
+    struct hlist_node *tmp_page_node;
+    struct rmap_node *cur_rmap_node;
+    struct hlist_node *tmp_rmap_node;
+    u64 hash_val;
+
+    if (!test_bit(MMF_VM_SHAREABLE, &mm->flags))
+        return;
+
+    pr_info("usm_exit\n");
+    while (vma) {
+        if (vma->vm_flags & VM_SHAREABLE) {
+            addr = vma->vm_start;
+            /* iterate over each page in the vma */
+            while (addr < vma->vm_end) {
+                hlist_for_each_entry_safe(cur_rmap_node, tmp_rmap_node,\
+                    &rmap_hash_table[addr % nrmap_hash], hlist_link) {
+                    if (cur_rmap_node->mm != mm || cur_rmap_node->addr != addr)
+                        continue;
+                    hash_val = cur_rmap_node->old_hash_value;
+                    hlist_for_each_entry_safe(cur_page_node, tmp_page_node,\
+                        &page_hash_table[hash_val % npage_hash], hlist_link) {
+                        if (cur_page_node->hash_value != hash_val ||\
+                            cur_page_node->mm != mm || cur_page_node->addr != addr)
+                            continue;
+                        hash_del(&cur_page_node->hlist_link);
+                        free_page_node(cur_page_node);
+                    }
+                    hash_del(&cur_rmap_node->hlist_link);
+                    free_rmap_node(cur_rmap_node);
+                }
+            }
+            vma->vm_flags &= ~VM_SHAREABLE;
+        }
+        vma = vma->vm_next;
+    }
+    clear_bit(MMF_VM_SHAREABLE, &mm->flags);
+}
+
+static int __init usm_init(void)
+{
+    int error = 0;
+    pr_info("Entering usm_init...\n");
+    /* initialize the data structures */
+    if (page_hash_table_init() < 0) {
+        return -ENOMEM;
+    }
+    if (page_node_cache_init() < 0) {
+        error = -ENOMEM;
+        goto quit_free1;
+    }
+    if (rmap_hash_table_init() < 0) {
+        error = -ENOMEM;
+        goto quit_free2;
+    }
+    if (rmap_node_cache_init() < 0) {
+        error = -ENOMEM;
+        goto quit_free3;
+    }
+
+    spin_lock_init(&page_hash_lock);
+    spin_lock_init(&rmap_hash_lock);
+
+quit_free3:
     rmap_hash_table_free();
-	quit_free2:
+quit_free2:
     page_node_cache_free();
-    quit_free1:
+quit_free1:
     page_hash_table_free();
 
+    if (error < 0) {
+        pr_err("usm init failed\n");
+    }
     return error;
 }
+subsys_initcall(usm_init);

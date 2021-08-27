@@ -56,6 +56,7 @@ static inline int get_dumpable(struct mm_struct *mm)
 # define MMF_DUMP_MASK_DEFAULT_ELF	0
 #endif
 					/* leave room for more dump flags */
+#define MMF_VM_SHAREABLE	15	/* USM may merge identical pages */
 #define MMF_VM_MERGEABLE	16	/* KSM may merge identical pages */
 #define MMF_VM_HUGEPAGE		17	/* set when VM_HUGEPAGE is set on vma */
 /*
