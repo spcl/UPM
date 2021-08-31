@@ -200,12 +200,12 @@ static inline int add_page_to_hash_table(u64 hash_value, int hash_index, struct 
 
 /* 
  * Return -1: write_protect_page fails, go to next madivsed page.
- * Return -2: write_protect_page fails, go to next page in the hash table.
  * Return 0: write_protect_page succeeds.
  */
 static int write_protect_page(struct page *page1, struct page *page2, 
                     struct vm_area_struct *vma1, struct vm_area_struct *vma2)
 {
+    int err = 0;
     struct page_vma_mapped_walk pvmw1 = {
         .page = page1,
         .vma = vma1,
@@ -225,9 +225,10 @@ static int write_protect_page(struct page *page1, struct page *page2,
     }
     pvmw2.address = page_address_in_vma(page2, vma2);
     if (pvmw2.address == -EFAULT) {
-        return -2;
+        return -1;
     }
     if (!page_vma_mapped_walk(&pvmw2)) {
+        err = -1;
         goto out;
     }
 
@@ -237,7 +238,7 @@ static int write_protect_page(struct page *page1, struct page *page2,
     page_vma_mapped_walk_done(&pvmw2);
 out:
     page_vma_mapped_walk_done(&pvmw1);
-    return 0;
+    return err;
 }
 
 
@@ -349,8 +350,6 @@ out:
     return err;
 }
 
-
-
 /* return 1 if find identical page and get them merged, 0 otherwise */
 static int search_hash_table(u64 hash_value, int hash_index, struct page *page, 
                     unsigned long addr, struct mm_struct *mm, 
@@ -380,7 +379,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
             }
             /* 
             * Check if cur_page_node's content has been changed 
-            * since it is last added to the hash table.
+            * since it is added to the hash table.
             */
             if (get_user_pages(cur_page_node->addr, 1, 0, hash_page, NULL) != 1
                                 || !hash_page[0]) {
@@ -396,7 +395,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
             if (PageAnon(hash_page[0]) ^ PageAnon(page)) {
                 continue;
             }
-            /* check if the two pages already share the same physical page */
+            /* check if current checking address already points to the same physical page */
             if (unlikely(page_to_pfn(page) == page_to_pfn(hash_page[0]))) {
                 return 0;
             }
@@ -506,12 +505,13 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
     }
 
 	for (cur_addr = start; cur_addr < end; cur_addr += PAGE_SIZE) {
-        up_read(&mm->mmap_sem);
+        down_read(&mm->mmap_sem);
 
         /* get the struct page at address cur_addr */
         cur_page = follow_page(vma, cur_addr, FOLL_GET);
-        down_read(&mm->mmap_sem);
+        up_read(&mm->mmap_sem);
         if (cur_page == NULL) {
+            pr_info("usm: no present page at address %ld\n", cur_addr);
             continue;
         }
 
@@ -522,31 +522,34 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
         spin_lock(&rmap_hash_lock);
         rmap_bucket = &(rmap_hash_table[cur_addr % nrmap_hash]);
         hlist_for_each_entry_safe(old_rmap_node, n, rmap_bucket, hlist_link) {
-            if (old_rmap_node->old_hash_value != hash_value || old_rmap_node->mm != mm) {
-                hash_del(&old_rmap_node->hlist_link);
-                spin_lock(&page_hash_lock);
-                page_bucket = &(page_hash_table[old_rmap_node->old_hash_value % npage_hash]);
-                hlist_for_each_entry_safe(old_page_node, cur_node, page_bucket, hlist_link) {
-                    if (old_page_node->hash_value == old_rmap_node->old_hash_value) {
-                        hash_del(&old_page_node->hlist_link);
-                        break;
+            if (old_rmap_node->addr == cur_addr && old_rmap_node->mm == mm) {
+                if (old_rmap_node->old_hash_value != hash_value) {
+                    hash_del(&old_rmap_node->hlist_link);
+                    spin_lock(&page_hash_lock);
+                    page_bucket = &(page_hash_table[old_rmap_node->old_hash_value % npage_hash]);
+                    hlist_for_each_entry_safe(old_page_node, cur_node, page_bucket, hlist_link) {
+                        if (old_page_node->hash_value == old_rmap_node->old_hash_value) {
+                            hash_del(&old_page_node->hlist_link);
+                            break;
+                        }
                     }
+                    spin_unlock(&page_hash_lock);
+                    spin_unlock(&rmap_hash_lock);
+                    goto search_hash_table;
                 }
-                spin_unlock(&page_hash_lock);
-                spin_unlock(&rmap_hash_lock);
-                goto search_hash_table;
-            }
-            else {
-                /* the page is already added to USM, no need to do anything */
-                spin_unlock(&rmap_hash_lock);
-                goto next;
+                else {
+                    /* the page is already added to USM, no need to do anything */
+                    spin_unlock(&rmap_hash_lock);
+                    goto next;
+                }
             }
         }
-        search_hash_table:
-            search_hash_table(hash_value, hash_index, cur_page, cur_addr, mm, vma);
-            return 0;
-        next:
-            continue;
+        spin_unlock(&rmap_hash_lock);
+    search_hash_table:
+        search_hash_table(hash_value, hash_index, cur_page, cur_addr, mm, vma);
+        return 0;
+    next:
+        continue;
     }
 
     mmdrop(mm);
@@ -585,9 +588,11 @@ void usm_exit(struct mm_struct *mm)
                             continue;
                         hash_del(&cur_page_node->hlist_link);
                         free_page_node(cur_page_node);
+                        break;
                     }
                     hash_del(&cur_rmap_node->hlist_link);
                     free_rmap_node(cur_rmap_node);
+                    break;
                 }
             }
             vma->vm_flags &= ~VM_SHAREABLE;
