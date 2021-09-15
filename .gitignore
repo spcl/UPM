@@ -122,3 +122,8 @@ all.config
 
 # Kdevelop4
 *.kdev4
+
+# for mem-dedup project
+tools/
+samples/
+drivers/
