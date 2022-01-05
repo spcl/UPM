@@ -62,6 +62,7 @@
 #include <linux/random.h>
 #include <linux/rcuwait.h>
 #include <linux/compat.h>
+#include <linux/usm.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -852,6 +853,10 @@ void __noreturn do_exit(long code)
 	tsk->exit_code = code;
 	taskstats_exit(tsk, group_dead);
 
+	if (tsk->flags & PF_USM) {
+		usm_exit(task_pid_nr(tsk), tsk->mm);
+		tsk->flags &= ~PF_USM;
+	}
 	exit_mm();
 
 	if (group_dead)
