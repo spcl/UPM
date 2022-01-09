@@ -239,7 +239,7 @@ static int add_page_to_hash_table(u64 hash_value, int hash_index, struct page *p
     new_rmap_node->mm = mm;
     new_rmap_node->pid = current->pid;
     spin_lock(&rmap_hash_lock);
-    hlist_add_head(&new_rmap_node->hlist_link, &rmap_hash_table[addr % nrmap_hash]);
+    hlist_add_head(&new_rmap_node->hlist_link, &rmap_hash_table[(addr + current->pid) % nrmap_hash]);
     spin_unlock(&rmap_hash_lock);
 
     nr_pages_added++;
@@ -374,7 +374,6 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
                     struct vm_area_struct *vma, unsigned long *vm_flags)
 {
     int r;
-    int unlock_flag = 0;
     struct page_node *cur_page_node;
     spinlock_t *ptl;
     pte_t *ptep;
@@ -488,7 +487,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
             goto unlock;
 
         delete_hash_table_node:
-            bucket = &rmap_hash_table[cur_page_node->addr % nrmap_hash];
+            bucket = &rmap_hash_table[(cur_page_node->addr + current->pid) % nrmap_hash];
             spin_lock(&rmap_hash_lock);
             hlist_for_each_entry_safe(rmap_node, n, bucket, hlist_link) {
                 if (rmap_node->addr == cur_page_node->addr &&\
@@ -501,9 +500,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
                 }
             }
             spin_unlock(&rmap_hash_lock);
-            spin_lock(&page_hash_lock);
             hash_del(&cur_page_node->hlist_link);
-            spin_unlock(&page_hash_lock);
             free_page_node(cur_page_node);
             continue;
 
@@ -552,30 +549,7 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
     struct hlist_node *cur_node, *n;
     u64 hash_value;
     int hash_index;
-    u64 search_time = 0;
-    u64 follow_page_time = 0;
-    u64 hash_time = 0;
-    u64 madvise_time = 0;
-    u64 for_time = 0;
-    u64 mmgrab_time = 0;
-    u64 sec = 0;
-    u64 nsec = 0;
-    struct timespec64 madvise_before;
-    struct timespec64 madvise_after;
-    struct timespec64 hash_before;
-    struct timespec64 hash_after;
-    struct timespec64 follow_before;
-    struct timespec64 follow_after;
-    struct timespec64 search_before;
-    struct timespec64 search_after;
-    struct timespec64 mmgrab_before;
-    struct timespec64 mmgrab_after;
-    struct timespec64 mmdrop_before;
-    struct timespec64 mmdrop_after;
-    struct timespec64 for_before;
-    struct timespec64 for_after;
     // int counter = 0;
-    // ktime_get_ts64(&madvise_before);
 
     if (*vm_flags & (VM_SHARED  | VM_MAYSHARE   |
 				 VM_PFNMAP    | VM_IO      | VM_DONTEXPAND |
@@ -584,27 +558,16 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
 
     mm = vma->vm_mm;
     if (mm) {
-        // ktime_get_ts64(&mmgrab_before);
         mmgrab(mm);
-        // ktime_get_ts64(&mmgrab_after);
-        // sec = mmgrab_after.tv_sec - mmgrab_before.tv_sec;
-        // nsec = sec * 1000000000 + mmgrab_after.tv_nsec - mmgrab_before.tv_nsec;
-        // mmgrab_time += nsec;
     }
 
     // pr_info("Before going into usm, iterating and remove page tables:\n");
-    // ktime_get_ts64(&for_before);
 	for (cur_addr = start; cur_addr < end; cur_addr += PAGE_SIZE) {
         // down_read(&mm->mmap_sem);
         // pr_info("counter: %d\n", ++counter);
         // pr_info("checking cur_addr %ld\n", cur_addr);
         /* get the struct page at address cur_addr */
-        // ktime_get_ts64(&follow_before);
         cur_page = follow_page(vma, cur_addr, FOLL_GET);
-        // ktime_get_ts64(&follow_after);
-        // sec = follow_after.tv_sec - follow_before.tv_sec;
-        // nsec = sec * 1000000000 + follow_after.tv_nsec - follow_before.tv_nsec;
-        // follow_page_time += nsec;
         // up_read(&mm->mmap_sem);
         if (cur_page == NULL) {
             // pr_info("usm: no present page at address %lx\n", cur_addr);
@@ -612,69 +575,53 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
         }
         // pr_info("cur_page: %px, mapcount %d, refcount %d\n", cur_page, page_mapcount(cur_page), page_ref_count(cur_page));
 
-        // ktime_get_ts64(&hash_before);
         hash_value = get_hash_value(cur_page);
-        // ktime_get_ts64(&hash_after);
-        // sec = hash_after.tv_sec - hash_before.tv_sec;
-        // nsec = sec * 1000000000 + hash_after.tv_nsec - hash_before.tv_nsec;
-        // hash_time += nsec;
         hash_index = get_hash_index(hash_value);
 
         /* check if the page is already stored by USM */
-        // rmap_bucket = &(rmap_hash_table[cur_addr % nrmap_hash]);
-        // hlist_for_each_entry_safe(old_rmap_node, n, rmap_bucket, hlist_link) {
-        //     if (old_rmap_node->addr == cur_addr && old_rmap_node->mm == mm) {
-        //         if (old_rmap_node->old_hash_value != hash_value) {
-        //             // spin_lock(&rmap_hash_lock);
-        //             hash_del(&old_rmap_node->hlist_link);
-        //             // spin_unlock(&rmap_hash_lock);
-        //             page_bucket = &(page_hash_table[old_rmap_node->old_hash_value % npage_hash]);
-        //             hlist_for_each_entry_safe(old_page_node, cur_node, page_bucket, hlist_link) {
-        //                 if (old_page_node->hash_value == old_rmap_node->old_hash_value) {
-        //                     // spin_lock(&page_hash_lock);
-        //                     hash_del(&old_page_node->hlist_link);
-        //                     // spin_unlock(&page_hash_lock);
-        //                     break;
-        //                 }
-        //             }
-        //             free_page_node(old_page_node);
-        //             free_rmap_node(old_rmap_node);
-        //             goto search_hash_table;
-        //         }
-        //         else {
-        //             /* the page is already added to USM, no need to do anything */
-        //             goto next;
-        //         }
-        //     }
-        // }
+        rmap_bucket = &(rmap_hash_table[(cur_addr + current->pid) % nrmap_hash]);
+        spin_lock(&rmap_hash_lock);
+        hlist_for_each_entry_safe(old_rmap_node, n, rmap_bucket, hlist_link) {
+            if (old_rmap_node->addr == cur_addr && old_rmap_node->mm == mm) {
+                if (old_rmap_node->old_hash_value != hash_value) {
+                    hash_del(&old_rmap_node->hlist_link);
+                    page_bucket = &(page_hash_table[old_rmap_node->old_hash_value % npage_hash]);
+                    spin_unlock(&rmap_hash_lock);
+                    spin_lock(&page_hash_lock);
+                    hlist_for_each_entry_safe(old_page_node, cur_node, page_bucket, hlist_link) {
+                        if (old_page_node->hash_value == old_rmap_node->old_hash_value) {
+                            hash_del(&old_page_node->hlist_link);
+                            break;
+                        }
+                    }
+                    spin_unlock(&page_hash_lock);
+                    spin_lock(&rmap_hash_lock);
+                    free_page_node(old_page_node);
+                    free_rmap_node(old_rmap_node);
+                    goto search_hash_table;
+                }
+                else {
+                    /* the page is already added to USM, no need to do anything */
+                    spin_unlock(&rmap_hash_lock);
+                    goto next;
+                }
+            }
+        }
     search_hash_table:
         // counter += 1;
-        // ktime_get_ts64(&search_before);
+        spin_unlock(&rmap_hash_lock);
         search_hash_table(hash_value, hash_index, cur_page, cur_addr, mm, vma, vm_flags);
-        // ktime_get_ts64(&search_after);
-        // sec = search_after.tv_sec - search_before.tv_sec;
-        // nsec = sec * 1000000000 + search_after.tv_nsec - search_before.tv_nsec;
-        // search_time += nsec;
     next:
         // iterate_hash_table();
         put_page(cur_page);
         continue;
     }
-    // ktime_get_ts64(&for_after);
-    // sec = for_after.tv_sec - for_before.tv_sec;
-    // nsec = sec * 1000000000 + for_after.tv_nsec - for_before.tv_nsec;
-    // for_time += nsec;
 
     mmdrop(mm);
-    // ktime_get_ts64(&madvise_after);
-    // sec = madvise_after.tv_sec - madvise_before.tv_sec;
-    // nsec = sec * 1000000000 + madvise_after.tv_nsec - madvise_before.tv_nsec;
-    // madvise_time += nsec;
     // pr_info("task pid %d has madvised address %lx, %ld pages, added %d pages to USM, replaced %d pages\n",\
             current->pid, start, (end-start)/4096, nr_pages_added, nr_pages_replaced);
     nr_pages_added = 0;
     nr_pages_replaced = 0;
-    // pr_info("search_time: %lld follow_time %lld hash_time %lld for_time %lld mmgrab_time %lld madvise_time %lld", search_time / 1000, follow_page_time / 1000, hash_time / 1000, for_time / 1000, mmgrab_time / 1000, madvise_time / 1000);
     // pr_info("enter into search_hash_time %d times\n", counter);
     return 0;
 }
