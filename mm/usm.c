@@ -217,8 +217,13 @@ static inline int get_hash_index(u64 hash_value)
 }
 
 static int add_page_to_hash_table(u64 hash_value, int hash_index, struct page *page,
-                unsigned long addr, struct mm_struct *mm)
+                unsigned long addr, struct mm_struct *mm, u64 *spin_time)
 {
+    u64 sec = 0;
+    u64 nsec = 0;
+    struct timespec64 spin_before;
+    struct timespec64 spin_after;
+
     struct page_node *new_page_node = alloc_page_node();
     struct rmap_node *new_rmap_node = alloc_rmap_node();
     if (!new_page_node || !new_rmap_node) {
@@ -230,17 +235,38 @@ static int add_page_to_hash_table(u64 hash_value, int hash_index, struct page *p
     new_page_node->page = page;
     new_page_node->mm = mm;
     new_page_node->addr = addr;
+    ktime_get_ts64(&spin_before);
     spin_lock(&page_hash_lock);
+    ktime_get_ts64(&spin_after);
+    sec = spin_after.tv_sec - spin_before.tv_sec;
+    nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+    *spin_time += nsec;
     hlist_add_head(&new_page_node->hlist_link, &page_hash_table[hash_index]);
+
+    ktime_get_ts64(&spin_before);
     spin_unlock(&page_hash_lock);
+    ktime_get_ts64(&spin_after);
+    sec = spin_after.tv_sec - spin_before.tv_sec;
+    nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+    *spin_time += nsec;
 
     new_rmap_node->old_hash_value = hash_value;
     new_rmap_node->addr = addr;
     new_rmap_node->mm = mm;
     new_rmap_node->pid = current->pid;
+    ktime_get_ts64(&spin_before);
     spin_lock(&rmap_hash_lock);
-    hlist_add_head(&new_rmap_node->hlist_link, &rmap_hash_table[addr % nrmap_hash]);
+    ktime_get_ts64(&spin_after);
+    sec = spin_after.tv_sec - spin_before.tv_sec;
+    nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+    *spin_time += nsec;
+    hlist_add_head(&new_rmap_node->hlist_link, &rmap_hash_table[(addr + current->pid) % nrmap_hash]);
+    ktime_get_ts64(&spin_before);
     spin_unlock(&rmap_hash_lock);
+    ktime_get_ts64(&spin_after);
+    sec = spin_after.tv_sec - spin_before.tv_sec;
+    nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+    *spin_time += nsec;
 
     nr_pages_added++;
     return 0;
@@ -371,10 +397,11 @@ out:
 /* return 1 if find identical page and get them merged, 0 otherwise */
 static int search_hash_table(u64 hash_value, int hash_index, struct page *page, 
                     unsigned long addr, struct mm_struct *mm, 
-                    struct vm_area_struct *vma, unsigned long *vm_flags)
+                    struct vm_area_struct *vma, unsigned long *vm_flags, u64 *spin_time, u64 *add_time, u64 *replace_time)
 {
-    int r;
-    int unlock_flag = 0;
+    u64 sec = 0;
+    u64 nsec = 0;
+    int r, result;
     struct page_node *cur_page_node;
     spinlock_t *ptl;
     pte_t *ptep;
@@ -385,11 +412,23 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
     struct page *hash_page;
     struct vm_area_struct *cur_page_node_vma;
     struct mm_struct *cur_page_node_mm;
+    struct timespec64 add_before;
+    struct timespec64 add_after;
+    struct timespec64 replace_before;
+    struct timespec64 replace_after;
+    struct timespec64 spin_before;
+    struct timespec64 spin_after;
     // pr_info("search madvised page: %px at addr %ld, vma %px, mm %px in hash tables\n",\
             page, addr, vma, mm);
 
     /* iterate through each page in the hash table has the same hash_index */
+    
+    ktime_get_ts64(&spin_before);
     spin_lock(&page_hash_lock);
+    ktime_get_ts64(&spin_after);
+    sec = spin_after.tv_sec - spin_before.tv_sec;
+    nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+    *spin_time += nsec;
     hlist_for_each_entry_safe(cur_page_node, node, &page_hash_table[hash_index], hlist_link){
         if (cur_page_node->hash_value == hash_value) {
             /* check if cur_page_node is still present */
@@ -454,8 +493,14 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
                 // pr_info("found page %px fwith the same content with page %px\n",\
                         page, cur_page_node->page);
                 /* merge the pages */
-                if (replace_page(page, cur_page_node->page, vma, 
-                                cur_page_node_vma, addr, cur_page_node->addr) < 0) {
+                ktime_get_ts64(&replace_before);
+                result = replace_page(page, cur_page_node->page, vma, 
+                                cur_page_node_vma, addr, cur_page_node->addr);
+                ktime_get_ts64(&replace_after);
+                sec = replace_after.tv_sec - replace_before.tv_sec;
+                nsec = sec * 1000000000 + replace_after.tv_nsec - replace_before.tv_nsec;
+                *replace_time += nsec;
+                if (result < 0) {
                     /*
                      * If replace_page fails, there won't be another page in the hash
                      * tablefre that has the same content with the madvised page (if there is,
@@ -488,7 +533,7 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
             goto unlock;
 
         delete_hash_table_node:
-            bucket = &rmap_hash_table[cur_page_node->addr % nrmap_hash];
+            bucket = &rmap_hash_table[(cur_page_node->addr + current->pid) % nrmap_hash];
             spin_lock(&rmap_hash_lock);
             hlist_for_each_entry_safe(rmap_node, n, bucket, hlist_link) {
                 if (rmap_node->addr == cur_page_node->addr &&\
@@ -516,18 +561,34 @@ static int search_hash_table(u64 hash_value, int hash_index, struct page *page,
                 continue;
             }
             else {
+                ktime_get_ts64(&spin_before);
                 spin_unlock(&page_hash_lock);
+                ktime_get_ts64(&spin_after);
+                sec = spin_after.tv_sec - spin_before.tv_sec;
+                nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+                *spin_time += nsec;
                 return r;
             }
         }
     }
+    ktime_get_ts64(&spin_before);
     spin_unlock(&page_hash_lock);
+    ktime_get_ts64(&spin_after);
+    sec = spin_after.tv_sec - spin_before.tv_sec;
+    nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+    *spin_time += nsec;
 
     /*
      * If the function haven't returned yet, this means no matching page is found,
      * add this page to the hash table.
      */
-    r = add_page_to_hash_table(hash_value, hash_index, page, addr, mm);
+    ktime_get_ts64(&add_before);
+    r = add_page_to_hash_table(hash_value, hash_index, page, addr, mm, spin_time);
+    ktime_get_ts64(&add_after);
+    sec = add_after.tv_sec - add_before.tv_sec;
+    nsec = sec * 1000000000 + add_after.tv_nsec - add_before.tv_nsec;
+    *add_time += nsec;
+    
     if (r == 0) {
         current->flags |= PF_USM;
     }
@@ -554,9 +615,10 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
     u64 follow_page_time = 0;
     u64 hash_time = 0;
     u64 madvise_time = 0;
-    u64 for_time = 0;
-    u64 mmgrab_time = 0;
     u64 check_time = 0;
+    u64 spin_time = 0;
+    u64 add_time = 0;
+    u64 replace_time = 0;
     u64 sec = 0;
     u64 nsec = 0;
     struct timespec64 madvise_before;
@@ -567,16 +629,11 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
     struct timespec64 follow_after;
     struct timespec64 search_before;
     struct timespec64 search_after;
-    struct timespec64 mmgrab_before;
-    struct timespec64 mmgrab_after;
-    struct timespec64 mmdrop_before;
-    struct timespec64 mmdrop_after;
-    struct timespec64 for_before;
-    struct timespec64 for_after;
     struct timespec64 check_before;
     struct timespec64 check_after;
-    int check_iterate_times = 0;
-    int repeated_page_num = 0;
+    struct timespec64 spin_before;
+    struct timespec64 spin_after;
+
     // int counter = 0;
     ktime_get_ts64(&madvise_before);
 
@@ -591,7 +648,6 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
     }
 
     // pr_info("Before going into usm, iterating and remove page tables:\n");
-    ktime_get_ts64(&for_before);
 	for (cur_addr = start; cur_addr < end; cur_addr += PAGE_SIZE) {
         // down_read(&mm->mmap_sem);
         // pr_info("counter: %d\n", ++counter);
@@ -619,31 +675,37 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
         hash_index = get_hash_index(hash_value);
 
         /* check if the page is already stored by USM */
-        rmap_bucket = &(rmap_hash_table[cur_addr % nrmap_hash]);
+        rmap_bucket = &(rmap_hash_table[(cur_addr + current->pid) % nrmap_hash]);
         ktime_get_ts64(&check_before);
+        ktime_get_ts64(&spin_before);
+        spin_lock(&rmap_hash_lock);
+        ktime_get_ts64(&spin_after);
+        sec = spin_after.tv_sec - spin_before.tv_sec;
+        nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+        spin_time += nsec;
+
         hlist_for_each_entry_safe(old_rmap_node, n, rmap_bucket, hlist_link) {
-            check_iterate_times++;
             if (old_rmap_node->addr == cur_addr && old_rmap_node->mm == mm) {
                 if (old_rmap_node->old_hash_value != hash_value) {
-                    repeated_page_num++;
-                    // spin_lock(&rmap_hash_lock);
                     hash_del(&old_rmap_node->hlist_link);
-                    // spin_unlock(&rmap_hash_lock);
                     page_bucket = &(page_hash_table[old_rmap_node->old_hash_value % npage_hash]);
+                    spin_unlock(&rmap_hash_lock);
+                    spin_lock(&page_hash_lock);
                     hlist_for_each_entry_safe(old_page_node, cur_node, page_bucket, hlist_link) {
                         if (old_page_node->hash_value == old_rmap_node->old_hash_value) {
-                            // spin_lock(&page_hash_lock);
                             hash_del(&old_page_node->hlist_link);
-                            // spin_unlock(&page_hash_lock);
                             break;
                         }
                     }
+                    spin_unlock(&page_hash_lock);
+                    spin_lock(&rmap_hash_lock);
                     free_page_node(old_page_node);
                     free_rmap_node(old_rmap_node);
                     goto search_hash_table;
                 }
                 else {
                     /* the page is already added to USM, no need to do anything */
+                    spin_unlock(&rmap_hash_lock);
                     ktime_get_ts64(&check_after);
                     sec = check_after.tv_sec - check_before.tv_sec;
                     nsec = sec * 1000000000 + check_after.tv_nsec - check_before.tv_nsec;
@@ -653,13 +715,20 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
             }
         }
     search_hash_table:
+        ktime_get_ts64(&spin_before);
+        spin_unlock(&rmap_hash_lock);
+        ktime_get_ts64(&spin_after);
+        sec = spin_after.tv_sec - spin_before.tv_sec;
+        nsec = sec * 1000000000 + spin_after.tv_nsec - spin_before.tv_nsec;
+        spin_time += nsec;
+
         ktime_get_ts64(&check_after);
         sec = check_after.tv_sec - check_before.tv_sec;
         nsec = sec * 1000000000 + check_after.tv_nsec - check_before.tv_nsec;
         check_time += nsec;
         // counter += 1;
         ktime_get_ts64(&search_before);
-        search_hash_table(hash_value, hash_index, cur_page, cur_addr, mm, vma, vm_flags);
+        search_hash_table(hash_value, hash_index, cur_page, cur_addr, mm, vma, vm_flags, &spin_time, &add_time, &replace_time);
         ktime_get_ts64(&search_after);
         sec = search_after.tv_sec - search_before.tv_sec;
         nsec = sec * 1000000000 + search_after.tv_nsec - search_before.tv_nsec;
@@ -669,10 +738,6 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
         put_page(cur_page);
         continue;
     }
-    ktime_get_ts64(&for_after);
-    sec = for_after.tv_sec - for_before.tv_sec;
-    nsec = sec * 1000000000 + for_after.tv_nsec - for_before.tv_nsec;
-    for_time += nsec;
 
     mmdrop(mm);
     ktime_get_ts64(&madvise_after);
@@ -683,8 +748,8 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
             current->pid, start, (end-start)/4096, nr_pages_added, nr_pages_replaced);
     nr_pages_added = 0;
     nr_pages_replaced = 0;
-    pr_info("search_time: %lld follow_time %lld hash_time %lld check_time %lld check_iterate %d repeated_page %d for_time %lld madvise_time %lld",
-            search_time / 1000, follow_page_time / 1000, hash_time / 1000, check_time / 1000, check_iterate_times, repeated_page_num, for_time / 1000, madvise_time / 1000);
+    pr_info("search_time %lld add_time %lld replace_time %lld spin_time %lld, follow_time %lld hash_time %lld check_time %lld  madvise_time %lld ",
+            search_time / 1000, add_time / 1000, replace_time / 1000, spin_time / 1000, follow_page_time / 1000, hash_time / 1000, check_time / 1000, madvise_time / 1000);
     // pr_info("enter into search_hash_time %d times\n", counter);
     return 0;
 }
@@ -698,6 +763,13 @@ void usm_exit(int pid, struct mm_struct *mm)
     struct hlist_node *tmp_rmap_node;
     u64 hash_val;
     int i;
+    u64 exit_time = 0;
+    u64 sec = 0;
+    u64 nsec = 0;
+    struct timespec64 exit_before;
+    struct timespec64 exit_after;
+
+    ktime_get_ts64(&exit_before);
 
     // pr_info("usm_exit for mm %px, pid %d\n", mm, pid);
     for (i = 0, cur_rmap_node = NULL; i < nrmap_hash; i++) {
@@ -722,6 +794,12 @@ void usm_exit(int pid, struct mm_struct *mm)
         }
     }
     current->flags &= ~PF_USM;
+
+    ktime_get_ts64(&exit_after);
+    sec = exit_after.tv_sec - exit_before.tv_sec;
+    nsec = sec * 1000000000 + exit_after.tv_nsec - exit_before.tv_nsec;
+    exit_time += nsec;
+    pr_info("usm_exit time: %lld\n", exit_time);
     // iterate_hash_table();
 }
 
