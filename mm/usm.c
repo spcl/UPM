@@ -26,7 +26,7 @@
 #include "internal.h"
 
 #define DEFAULT_XXHASH_SEED 0
-#define USM_MAX_SIZE (200 * 1024 * 1024)
+#define USM_MAX_SIZE (2 * 1024 * 1024)
 #define HASH_INDEX_SIZE_COEFFICIENT 1.3
 
 static int nr_pages_added;
@@ -98,7 +98,7 @@ static void iterate_hash_table(void)
 
 static inline int page_hash_table_init(void)
 {
-    npage_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE / PAGE_SIZE;
+    npage_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE * 1024 / PAGE_SIZE ;
     page_hash_table = kzalloc(npage_hash * sizeof(struct hlist_head), GFP_KERNEL);
 	if (!page_hash_table) {
         pr_err("usm: cannot allocate space for page hash table, quiting\n");
@@ -109,7 +109,7 @@ static inline int page_hash_table_init(void)
 
 static inline int rmap_hash_table_init(void)
 {
-    nrmap_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE / PAGE_SIZE;
+    nrmap_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE * 1024 / PAGE_SIZE;
     rmap_hash_table = kzalloc(nrmap_hash * sizeof(struct hlist_head), GFP_KERNEL);
 	if (!rmap_hash_table) {
         pr_err("usm: cannot allocate space for rmap hash table, quiting\n");
