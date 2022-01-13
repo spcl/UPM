@@ -10,6 +10,7 @@
 #include <linux/rmap.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/memory.h>
 #include <linux/hashtable.h>
 #include <linux/oom.h>
@@ -48,8 +49,8 @@ struct rmap_node {
     struct hlist_node hlist_link;
 };
 
-static int npage_hash;
-static int nrmap_hash;
+static long npage_hash;
+static long nrmap_hash;
 static struct hlist_head *page_hash_table;
 static struct hlist_head *rmap_hash_table;
 static struct kmem_cache *page_node_cache;
@@ -98,23 +99,34 @@ static void iterate_hash_table(void)
 
 static inline int page_hash_table_init(void)
 {
-    npage_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE * 1024 / PAGE_SIZE ;
-    page_hash_table = kzalloc(npage_hash * sizeof(struct hlist_head), GFP_KERNEL);
+    npage_hash =  (long)(HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE * 1024.0 / PAGE_SIZE);
+    //page_hash_table = kzalloc(npage_hash * sizeof(struct hlist_head), GFP_KERNEL);
+    pr_err("USM INIT: hash %ld size %ld\n", npage_hash * sizeof(struct hlist_head));
+    page_hash_table = vmalloc(npage_hash * sizeof(struct hlist_head));
 	if (!page_hash_table) {
         pr_err("usm: cannot allocate space for page hash table, quiting\n");
         return -1;
     }
+    memset(page_hash_table, 0, npage_hash * sizeof(struct hlist_head));
     return 0;
 }
 
 static inline int rmap_hash_table_init(void)
 {
-    nrmap_hash =  HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE * 1024 / PAGE_SIZE;
-    rmap_hash_table = kzalloc(nrmap_hash * sizeof(struct hlist_head), GFP_KERNEL);
+    //pr_err("USM BEFORE INIT: hash %ld page size %ld USM_MAX %d\n", nrmap_hash, PAGE_SIZE,USM_MAX_SIZE*1024);
+    //pr_err("USM BEFORE INIT: hash %ld\n", HASH_INDEX_SIZE_COEFFICIENT * ((long)USM_MAX_SIZE) * 1024 / PAGE_SIZE);
+    //pr_err("USM BEFORE INIT: hash %ld\n", HASH_INDEX_SIZE_COEFFICIENT * ((long)USM_MAX_SIZE) * ((long)1024) / PAGE_SIZE);
+    nrmap_hash =  (long)(HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE * 1024 / PAGE_SIZE);
+    //pr_err("USM AFTER INIT: hash %ld page size %ld USM_MAX %d\n", nrmap_hash, PAGE_SIZE,USM_MAX_SIZE*1024);
+    //rmap_hash_table = kzalloc(nrmap_hash * sizeof(struct hlist_head), GFP_KERNEL);
+    pr_err("USM INIT: hash %ld size %ld\n", nrmap_hash * sizeof(struct hlist_head));
+    rmap_hash_table = vmalloc(nrmap_hash * sizeof(struct hlist_head));
 	if (!rmap_hash_table) {
         pr_err("usm: cannot allocate space for rmap hash table, quiting\n");
         return -1;
     }
+
+    memset(rmap_hash_table, 0, nrmap_hash * sizeof(struct hlist_head));
     return 0;
 }
 
@@ -562,6 +574,12 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
     }
 
     // pr_info("Before going into usm, iterating and remove page tables:\n");
+    //pr_info("USM BEFORE MADVISE 2: hash %ld\n", nrmap_hash);
+    //pr_info("USM BEFORE MADVISE 2: hash %ld page coeff %f size %ld USM_MAX %d\n", nrmap_hash, HASH_INDEX_SIZE_COEFFICIENT, PAGE_SIZE,USM_MAX_SIZE*1024);
+    //pr_info("USM BEFORE INIT 2: hash %ld\n", HASH_INDEX_SIZE_COEFFICIENT * ((long)USM_MAX_SIZE) * 1024 / PAGE_SIZE);
+    //pr_info("USM BEFORE INIT 2: hash %ld\n", HASH_INDEX_SIZE_COEFFICIENT * ((long)USM_MAX_SIZE) * ((long)1024) / PAGE_SIZE);
+    //nrmap_hash =  (long)(HASH_INDEX_SIZE_COEFFICIENT * USM_MAX_SIZE * 1024 / PAGE_SIZE);
+    //pr_info("USM AFTER INIT 2: hash %ld page size %ld USM_MAX %d\n", nrmap_hash, PAGE_SIZE,USM_MAX_SIZE*1024);
 	for (cur_addr = start; cur_addr < end; cur_addr += PAGE_SIZE) {
         // down_read(&mm->mmap_sem);
         // pr_info("counter: %d\n", ++counter);
@@ -579,6 +597,8 @@ int usm_madvise(struct vm_area_struct *vma, unsigned long start,
         hash_index = get_hash_index(hash_value);
 
         /* check if the page is already stored by USM */
+	//pr_info("USM BEFORE BUCKET QUERY: hash %ld\n", nrmap_hash);
+	//pr_info("USM BEFORE BUCKET QUERY: idx %ld %ld\n", cur_addr + current->pid, (cur_addr + current->pid) % nrmap_hash);
         rmap_bucket = &(rmap_hash_table[(cur_addr + current->pid) % nrmap_hash]);
         spin_lock(&rmap_hash_lock);
         hlist_for_each_entry_safe(old_rmap_node, n, rmap_bucket, hlist_link) {
